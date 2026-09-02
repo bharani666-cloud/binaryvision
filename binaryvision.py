@@ -69,8 +69,16 @@ ANSI_BOLD = "\x1b[1m"
 FRAME_INTRO_SECONDS = 1.4   # length of the "materializing" intro for binary/ascii modes
 STEADY_GLITCH_RATE = 0.012  # fraction of cells that flicker per frame once settled
 SCAN_SWEEP_SECONDS = 1.8    # time for the scan bar to cross the whole image once
-SHAKE_DURATION = 0.9        # seconds of screen-shake before the image starts to appear
-SHAKE_MAX_AMPLITUDE = 6     # max horizontal jitter, in characters, at the start of the shake
+CLARITY_HOLD_SECONDS = 2.5  # after this much settled time, drop glitch to 0 for a clean hold
+
+SHAKE_SECONDS = 1.6         # default duration of the pre-reveal "screen shake" intro
+SHAKE_MESSAGES = [
+    "INTERCEPTING SIGNAL...",
+    "DECRYPTING PAYLOAD...",
+    "BYPASSING CHECKSUM...",
+    "SYNCING BUFFER...",
+    "STABILIZING FEED...",
+]
 
 
 # --------------------------------------------------------------------------
@@ -273,16 +281,8 @@ class BinaryVisionApp:
 
         avail_cols = max(10, term_cols - 2)
         avail_rows = max(5, term_rows - self.HEADER_LINES - self.FOOTER_LINES)
-        self.avail_rows = avail_rows
 
         self.cols, self.rows = compute_grid_size(self.img_w, self.img_h, avail_cols, avail_rows)
-
-        # Center the image grid horizontally in the terminal, and vertically
-        # within the space available for it (below the header, above the footer).
-        self.h_pad = max(0, (self.term_cols - self.cols) // 2)
-        extra_rows = max(0, avail_rows - self.rows)
-        self.v_pad_top = extra_rows // 2
-        self.v_pad_bottom = extra_rows - self.v_pad_top
 
         self.brightness_grid = build_brightness_grid(self.image, self.cols, self.rows)
         self.target_grid = build_target_grid(
@@ -313,9 +313,11 @@ class BinaryVisionApp:
         if self.mode == "scan":
             self.revealed = [[False] * self.cols for _ in range(self.rows)]
             self.scan_pos = 0.0
+            self.scan_frozen = False  # once the bar sweeps top->bottom once, hold a clean frame
 
         if self.mode == "matrix":
             self.revealed = [[False] * self.cols for _ in range(self.rows)]
+            self.matrix_frozen = False  # once fully revealed, hold a clean frame
             self.head_pos = []
             self.speed = []
             self.trail_len = []
@@ -353,11 +355,14 @@ class BinaryVisionApp:
     # -- per-frame state update ------------------------------------------
 
     def _update_binary_ascii(self, elapsed):
-        """Materialize intro, then settle into a steady image with light glitch."""
+        """Materialize intro, then settle into a steady image with light glitch,
+        then (for high-clarity) hold a perfectly clean frame."""
         if elapsed < FRAME_INTRO_SECONDS:
             reveal_prob = elapsed / FRAME_INTRO_SECONDS
-        else:
+        elif elapsed < FRAME_INTRO_SECONDS + CLARITY_HOLD_SECONDS:
             reveal_prob = 1.0 - STEADY_GLITCH_RATE
+        else:
+            reveal_prob = 1.0  # fully settled: crisp, glitch-free hold
 
         chars = "01" if self.mode != "ascii" else ASCII_RAMP
         grid = [[None] * self.cols for _ in range(self.rows)]
@@ -372,12 +377,25 @@ class BinaryVisionApp:
 
     def _update_scan(self, elapsed):
         rows = self.rows
+
+        if self.scan_frozen:
+            # High-clarity hold: the sweep already completed one full pass,
+            # so just show the crisp, unaltered image with no glitch.
+            grid = [row[:] for row in self.target_grid]
+            return grid, 1.0, rows - 1
+
         sweep = (elapsed / SCAN_SWEEP_SECONDS) * rows
-        self.scan_pos = sweep % (rows * 2)  # ping-pong across 0..rows..0
-        if self.scan_pos <= rows:
-            band = self.scan_pos
-        else:
-            band = (rows * 2) - self.scan_pos
+        if sweep >= rows:
+            # First top-to-bottom pass just completed: freeze on a clean image.
+            self.scan_frozen = True
+            for r in range(rows):
+                for c in range(self.cols):
+                    self.revealed[r][c] = True
+            grid = [row[:] for row in self.target_grid]
+            return grid, 1.0, rows - 1
+
+        self.scan_pos = sweep
+        band = self.scan_pos
 
         grid = [[None] * self.cols for _ in range(self.rows)]
         revealed_count = 0
@@ -406,6 +424,14 @@ class BinaryVisionApp:
 
     def _update_matrix(self, elapsed, dt):
         rows, cols = self.rows, self.cols
+
+        if self.matrix_frozen:
+            grid = [row[:] for row in self.target_grid]
+            levels_grid = [
+                [max(1, brightness_level(v)) for v in row] for row in self.brightness_grid
+            ]
+            return grid, levels_grid, 1.0
+
         grid = [[" "] * cols for _ in range(rows)]
         levels_grid = [[0] * cols for _ in range(rows)]
         revealed_count = 0
@@ -443,6 +469,8 @@ class BinaryVisionApp:
         for r in range(rows):
             revealed_count += sum(1 for c in range(cols) if self.revealed[r][c])
         progress = revealed_count / float(rows * cols)
+        if progress >= 0.999:
+            self.matrix_frozen = True
         return grid, levels_grid, progress
 
     # -- rendering -----------------------------------------------------
@@ -455,31 +483,11 @@ class BinaryVisionApp:
         title = " BINARYVISION // IMAGE SCAN"
         title_line = "\u2551" + title.ljust(inner) + "\u2551"
 
-        box_pad = " " * max(0, (self.term_cols - width) // 2)
-
         def clip(s):
             return s if len(s) <= self.term_cols else s[: self.term_cols - 1]
 
-        lines = [
-            clip(box_pad + top),
-            clip(box_pad + title_line),
-            clip(box_pad + bottom),
-            clip(status_line),
-            clip(progress_line),
-        ]
+        lines = [clip(top), clip(title_line), clip(bottom), clip(status_line), clip(progress_line)]
         return lines
-
-    def _shift_line(self, line: str, offset: int) -> str:
-        """Shift a rendered line right by `offset` characters, clamped so it
-        never overflows the terminal width (used for the screen-shake intro)."""
-        if offset <= 0:
-            return line
-        visible_len = _visible_length(line)
-        slack = max(0, self.term_cols - visible_len)
-        off = min(offset, slack)
-        if off <= 0:
-            return line
-        return (" " * off) + line
 
     def _status_text(self):
         fname = os.path.basename(self.args.image)
@@ -488,65 +496,40 @@ class BinaryVisionApp:
             f"term: {self.term_cols}x{self.term_rows}  |  grid: {self.cols}x{self.rows}"
         )
 
-    def _progress_text(self, extra: str, state: str = None):
-        if state is None:
-            state = "PAUSED" if self.paused else "RUNNING"
+    def _progress_text(self, extra: str):
+        state = "PAUSED" if self.paused else "RUNNING"
         return f" mode: {self.mode}  |  color: {'off' if self.no_color else self.args.color}  |  fps: {self.fps}  |  {extra}  |  status: {state}"
 
-    def _shake_frame(self, raw_elapsed: float):
-        """Full-screen noise + decaying horizontal jitter, played once before
-        the image starts to materialize."""
-        progress = max(0.0, min(1.0, raw_elapsed / SHAKE_DURATION))
-        amplitude = int(round(SHAKE_MAX_AMPLITUDE * (1.0 - progress)))
-        offset = random.randint(0, amplitude) if amplitude > 0 else 0
-        chars = "01"
-        grid = [[random.choice(chars) for _ in range(self.cols)] for _ in range(self.rows)]
-        return grid, offset, progress
-
     def render_frame(self, dt: float) -> str:
-        raw_elapsed = self.elapsed()
-        shaking = raw_elapsed < SHAKE_DURATION
-        h_shift = 0
+        elapsed = self.elapsed()
 
-        if shaking:
-            grid, h_shift, shake_progress = self._shake_frame(raw_elapsed)
-            extra = f"calibrating: {int(shake_progress * 100)}%"
-            status_text = self._progress_text(extra, state="INITIALIZING")
-            body_lines = [
-                render_row(grid[r], self.brightness_grid[r], self.color_rgb, self.no_color)
-                for r in range(self.rows)
-            ]
-        else:
-            elapsed = raw_elapsed - SHAKE_DURATION
-            if self.mode in ("binary", "ascii"):
-                grid, reveal_prob = self._update_binary_ascii(elapsed)
-                extra = f"reveal: {min(100, int(reveal_prob * 100))}%"
-                body_lines = [
-                    render_row(grid[r], self.brightness_grid[r], self.color_rgb, self.no_color)
-                    for r in range(self.rows)
-                ]
-            elif self.mode == "scan":
-                grid, progress, _band = self._update_scan(elapsed)
-                extra = f"reveal: {int(progress * 100)}%"
-                body_lines = [
-                    render_row(grid[r], self.brightness_grid[r], self.color_rgb, self.no_color)
-                    for r in range(self.rows)
-                ]
-            else:  # matrix
-                grid, level_grid, progress = self._update_matrix(elapsed, dt)
-                extra = f"reveal: {int(progress * 100)}%"
+        if self.mode in ("binary", "ascii"):
+            grid, reveal_prob = self._update_binary_ascii(elapsed)
+            level_source = self.brightness_grid
+            extra = f"reveal: {min(100, int(reveal_prob * 100))}%"
+        elif self.mode == "scan":
+            grid, progress, _band = self._update_scan(elapsed)
+            level_source = self.brightness_grid
+            extra = f"reveal: {int(progress * 100)}%"
+        else:  # matrix
+            grid, level_grid, progress = self._update_matrix(elapsed, dt)
+            level_source = None
+            extra = f"reveal: {int(progress * 100)}%"
+
+        out_lines = self._header_lines(self._status_text(), self._progress_text(extra))
+
+        body_lines = []
+        for r in range(self.rows):
+            row_chars = grid[r]
+            if self.mode == "matrix":
                 if self.no_color:
-                    body_lines = ["".join(grid[r]) for r in range(self.rows)]
+                    line = "".join(row_chars)
                 else:
-                    body_lines = [self._render_matrix_row(grid[r], level_grid[r]) for r in range(self.rows)]
-            status_text = self._progress_text(extra)
-
-        out_lines = self._header_lines(self._status_text(), status_text)
-
-        # Center the grid horizontally (pad) and vertically (blank filler rows).
-        h_pad_str = " " * self.h_pad
-        body_lines = [h_pad_str + line for line in body_lines]
-        body_lines = ([""] * self.v_pad_top) + body_lines + ([""] * self.v_pad_bottom)
+                    line = self._render_matrix_row(row_chars, level_grid[r])
+            else:
+                brightnesses = self.brightness_grid[r]
+                line = render_row(row_chars, brightnesses, self.color_rgb, self.no_color)
+            body_lines.append(line)
 
         footer = [
             "",
@@ -554,18 +537,11 @@ class BinaryVisionApp:
         ]
 
         all_lines = out_lines + body_lines + footer
+        # Center the whole block in the terminal, padding every line so
+        # leftover characters from a previous, longer frame never linger.
+        centered = center_block(all_lines, self.term_cols)
 
-        pad_w = self.term_cols
-        padded = []
-        for line in all_lines:
-            if shaking and h_shift:
-                line = self._shift_line(line, h_shift)
-            visible_len = _visible_length(line)
-            if visible_len < pad_w:
-                line = line + " " * (pad_w - visible_len)
-            padded.append(line)
-
-        return ANSI_HOME + "\n".join(padded) + ANSI_RESET
+        return ANSI_HOME + "\n".join(centered) + ANSI_RESET
 
     def _render_matrix_row(self, chars, levels):
         parts = []
@@ -588,9 +564,12 @@ class BinaryVisionApp:
 
     def run(self):
         with KeyListener() as keys:
-            sys.stdout.write(ANSI_ALT_ON + ANSI_HIDE_CURSOR + ANSI_CLEAR)
-            sys.stdout.flush()
             try:
+                if not self.args.no_shake:
+                    run_shake_intro(self.color_rgb, self.no_color, duration=self.args.shake_seconds)
+
+                sys.stdout.write(ANSI_ALT_ON + ANSI_HIDE_CURSOR + ANSI_CLEAR)
+                sys.stdout.flush()
                 last = time.perf_counter()
                 while not self.quit:
                     frame_start = time.perf_counter()
@@ -625,6 +604,111 @@ class BinaryVisionApp:
             self.toggle_pause()
         elif key in ("r", "R"):
             self.restart()
+
+
+def center_block(lines, term_cols: int, x_offset: int = 0):
+    """
+    Horizontally center a block of already-rendered lines inside a
+    terminal of width term_cols, then pad every line out to the full
+    width so no stale characters from a previous, wider frame linger.
+
+    x_offset shifts the block left(-)/right(+) from centered — used for
+    the jitter/shake effect.
+    """
+    block_width = max((_visible_length(l) for l in lines), default=0)
+    left = max(0, (term_cols - block_width) // 2 + x_offset)
+
+    out = []
+    for line in lines:
+        padded_line = (" " * left) + line
+        visible_len = left + _visible_length(line)
+        if visible_len < term_cols:
+            padded_line += " " * (term_cols - visible_len)
+        elif visible_len > term_cols:
+            # Extremely narrow terminal / large jitter offset: clip safely.
+            padded_line = padded_line[:term_cols]
+        out.append(padded_line)
+    return out
+
+
+def run_shake_intro(color_rgb, no_color: bool, duration: float = SHAKE_SECONDS,
+                     fps: int = 30):
+    """
+    A brief 'the machine has been compromised' style intro: the terminal
+    flashes cyber-glitch noise and jitters side to side, then settles.
+    Purely cosmetic ANSI output — no filesystem/network side effects.
+
+    Runs before the real image reveal so the transition feels like
+    hollywood.mp4: shake -> settle -> image appears center-screen.
+    """
+    term_cols, term_rows = shutil.get_terminal_size(fallback=(80, 24))
+    rows = max(5, term_rows - 2)
+    cols = max(10, term_cols - 4)
+
+    alert_rgb = (255, 70, 70)
+    base_rgb = (60, 255, 110) if color_rgb is None else color_rgb
+
+    frame_interval = 1.0 / max(1, fps)
+    start = time.perf_counter()
+    msg_idx = 0
+    next_msg_switch = 0.0
+
+    sys.stdout.write(ANSI_ALT_ON + ANSI_HIDE_CURSOR + ANSI_CLEAR)
+    sys.stdout.flush()
+
+    try:
+        while True:
+            frame_start = time.perf_counter()
+            elapsed = frame_start - start
+            if elapsed >= duration:
+                break
+            progress = elapsed / duration  # 0 -> 1 over the intro
+
+            # Jitter amplitude decays from a hard shake down to a settle.
+            amplitude = max(0, int(round(6 * (1.0 - progress) ** 2)))
+            x_offset = random.randint(-amplitude, amplitude) if amplitude else 0
+
+            # Flip between a red "alert" flash and the normal cyber color.
+            flashing = (random.random() < (0.35 * (1.0 - progress)))
+            rgb = alert_rgb if flashing else base_rgb
+
+            if elapsed >= next_msg_switch:
+                msg_idx = random.randrange(len(SHAKE_MESSAGES))
+                next_msg_switch = elapsed + random.uniform(0.25, 0.5)
+            message = SHAKE_MESSAGES[msg_idx]
+
+            noise_density = 0.55 * (1.0 - progress) + 0.08
+            lines = []
+            title = " BINARYVISION // SIGNAL LOCK "
+            lines.append(title.center(cols, "="))
+            lines.append("")
+            body_rows = max(1, rows - 4)
+            for _r in range(body_rows):
+                chars = [
+                    random.choice("01") if random.random() < noise_density else " "
+                    for _ in range(cols)
+                ]
+                lines.append("".join(chars))
+            lines.append("")
+            lines.append(message.center(cols))
+
+            if no_color:
+                out_lines = lines
+            else:
+                color_code = truecolor_fg(*rgb)
+                out_lines = [f"{color_code}{ln}{ANSI_RESET}" if ln.strip() else ln for ln in lines]
+
+            centered = center_block(out_lines, term_cols, x_offset=x_offset)
+            sys.stdout.write(ANSI_HOME + "\n".join(centered))
+            sys.stdout.flush()
+
+            render_time = time.perf_counter() - frame_start
+            sleep_for = frame_interval - render_time
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    except KeyboardInterrupt:
+        # Let the real app / caller handle a clean shutdown.
+        raise
 
 
 def _visible_length(s: str) -> int:
@@ -678,6 +762,14 @@ def parse_args(argv=None):
         help="Brightness threshold 0-255 used for 0/1 mapping (default: 128)",
     )
     parser.add_argument("--invert", action="store_true", help="Invert the brightness mapping")
+    parser.add_argument(
+        "--shake-seconds", type=float, default=SHAKE_SECONDS,
+        help=f"Duration of the pre-reveal screen-shake/glitch intro in seconds (default: {SHAKE_SECONDS})",
+    )
+    parser.add_argument(
+        "--no-shake", action="store_true",
+        help="Skip the screen-shake glitch intro and go straight to the image reveal",
+    )
     return parser.parse_args(argv)
 
 
@@ -689,6 +781,9 @@ def main(argv=None):
         return 2
     if args.fps < 1:
         sys.stderr.write("Error: --fps must be at least 1.\n")
+        return 2
+    if args.shake_seconds < 0:
+        sys.stderr.write("Error: --shake-seconds must be >= 0.\n")
         return 2
 
     try:
@@ -714,3 +809,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
