@@ -69,6 +69,8 @@ ANSI_BOLD = "\x1b[1m"
 FRAME_INTRO_SECONDS = 1.4   # length of the "materializing" intro for binary/ascii modes
 STEADY_GLITCH_RATE = 0.012  # fraction of cells that flicker per frame once settled
 SCAN_SWEEP_SECONDS = 1.8    # time for the scan bar to cross the whole image once
+SHAKE_DURATION = 0.9        # seconds of screen-shake before the image starts to appear
+SHAKE_MAX_AMPLITUDE = 6     # max horizontal jitter, in characters, at the start of the shake
 
 
 # --------------------------------------------------------------------------
@@ -271,8 +273,16 @@ class BinaryVisionApp:
 
         avail_cols = max(10, term_cols - 2)
         avail_rows = max(5, term_rows - self.HEADER_LINES - self.FOOTER_LINES)
+        self.avail_rows = avail_rows
 
         self.cols, self.rows = compute_grid_size(self.img_w, self.img_h, avail_cols, avail_rows)
+
+        # Center the image grid horizontally in the terminal, and vertically
+        # within the space available for it (below the header, above the footer).
+        self.h_pad = max(0, (self.term_cols - self.cols) // 2)
+        extra_rows = max(0, avail_rows - self.rows)
+        self.v_pad_top = extra_rows // 2
+        self.v_pad_bottom = extra_rows - self.v_pad_top
 
         self.brightness_grid = build_brightness_grid(self.image, self.cols, self.rows)
         self.target_grid = build_target_grid(
@@ -445,11 +455,31 @@ class BinaryVisionApp:
         title = " BINARYVISION // IMAGE SCAN"
         title_line = "\u2551" + title.ljust(inner) + "\u2551"
 
+        box_pad = " " * max(0, (self.term_cols - width) // 2)
+
         def clip(s):
             return s if len(s) <= self.term_cols else s[: self.term_cols - 1]
 
-        lines = [clip(top), clip(title_line), clip(bottom), clip(status_line), clip(progress_line)]
+        lines = [
+            clip(box_pad + top),
+            clip(box_pad + title_line),
+            clip(box_pad + bottom),
+            clip(status_line),
+            clip(progress_line),
+        ]
         return lines
+
+    def _shift_line(self, line: str, offset: int) -> str:
+        """Shift a rendered line right by `offset` characters, clamped so it
+        never overflows the terminal width (used for the screen-shake intro)."""
+        if offset <= 0:
+            return line
+        visible_len = _visible_length(line)
+        slack = max(0, self.term_cols - visible_len)
+        off = min(offset, slack)
+        if off <= 0:
+            return line
+        return (" " * off) + line
 
     def _status_text(self):
         fname = os.path.basename(self.args.image)
@@ -458,41 +488,65 @@ class BinaryVisionApp:
             f"term: {self.term_cols}x{self.term_rows}  |  grid: {self.cols}x{self.rows}"
         )
 
-    def _progress_text(self, extra: str):
-        state = "PAUSED" if self.paused else "RUNNING"
+    def _progress_text(self, extra: str, state: str = None):
+        if state is None:
+            state = "PAUSED" if self.paused else "RUNNING"
         return f" mode: {self.mode}  |  color: {'off' if self.no_color else self.args.color}  |  fps: {self.fps}  |  {extra}  |  status: {state}"
 
+    def _shake_frame(self, raw_elapsed: float):
+        """Full-screen noise + decaying horizontal jitter, played once before
+        the image starts to materialize."""
+        progress = max(0.0, min(1.0, raw_elapsed / SHAKE_DURATION))
+        amplitude = int(round(SHAKE_MAX_AMPLITUDE * (1.0 - progress)))
+        offset = random.randint(0, amplitude) if amplitude > 0 else 0
+        chars = "01"
+        grid = [[random.choice(chars) for _ in range(self.cols)] for _ in range(self.rows)]
+        return grid, offset, progress
+
     def render_frame(self, dt: float) -> str:
-        elapsed = self.elapsed()
+        raw_elapsed = self.elapsed()
+        shaking = raw_elapsed < SHAKE_DURATION
+        h_shift = 0
 
-        if self.mode in ("binary", "ascii"):
-            grid, reveal_prob = self._update_binary_ascii(elapsed)
-            level_source = self.brightness_grid
-            extra = f"reveal: {min(100, int(reveal_prob * 100))}%"
-        elif self.mode == "scan":
-            grid, progress, _band = self._update_scan(elapsed)
-            level_source = self.brightness_grid
-            extra = f"reveal: {int(progress * 100)}%"
-        else:  # matrix
-            grid, level_grid, progress = self._update_matrix(elapsed, dt)
-            level_source = None
-            extra = f"reveal: {int(progress * 100)}%"
-
-        out_lines = self._header_lines(self._status_text(), self._progress_text(extra))
-
-        pad_w = self.term_cols
-        body_lines = []
-        for r in range(self.rows):
-            row_chars = grid[r]
-            if self.mode == "matrix":
+        if shaking:
+            grid, h_shift, shake_progress = self._shake_frame(raw_elapsed)
+            extra = f"calibrating: {int(shake_progress * 100)}%"
+            status_text = self._progress_text(extra, state="INITIALIZING")
+            body_lines = [
+                render_row(grid[r], self.brightness_grid[r], self.color_rgb, self.no_color)
+                for r in range(self.rows)
+            ]
+        else:
+            elapsed = raw_elapsed - SHAKE_DURATION
+            if self.mode in ("binary", "ascii"):
+                grid, reveal_prob = self._update_binary_ascii(elapsed)
+                extra = f"reveal: {min(100, int(reveal_prob * 100))}%"
+                body_lines = [
+                    render_row(grid[r], self.brightness_grid[r], self.color_rgb, self.no_color)
+                    for r in range(self.rows)
+                ]
+            elif self.mode == "scan":
+                grid, progress, _band = self._update_scan(elapsed)
+                extra = f"reveal: {int(progress * 100)}%"
+                body_lines = [
+                    render_row(grid[r], self.brightness_grid[r], self.color_rgb, self.no_color)
+                    for r in range(self.rows)
+                ]
+            else:  # matrix
+                grid, level_grid, progress = self._update_matrix(elapsed, dt)
+                extra = f"reveal: {int(progress * 100)}%"
                 if self.no_color:
-                    line = "".join(row_chars)
+                    body_lines = ["".join(grid[r]) for r in range(self.rows)]
                 else:
-                    line = self._render_matrix_row(row_chars, level_grid[r])
-            else:
-                brightnesses = self.brightness_grid[r]
-                line = render_row(row_chars, brightnesses, self.color_rgb, self.no_color)
-            body_lines.append(line)
+                    body_lines = [self._render_matrix_row(grid[r], level_grid[r]) for r in range(self.rows)]
+            status_text = self._progress_text(extra)
+
+        out_lines = self._header_lines(self._status_text(), status_text)
+
+        # Center the grid horizontally (pad) and vertically (blank filler rows).
+        h_pad_str = " " * self.h_pad
+        body_lines = [h_pad_str + line for line in body_lines]
+        body_lines = ([""] * self.v_pad_top) + body_lines + ([""] * self.v_pad_bottom)
 
         footer = [
             "",
@@ -500,10 +554,12 @@ class BinaryVisionApp:
         ]
 
         all_lines = out_lines + body_lines + footer
-        # Pad/truncate each visible line so leftover characters from a
-        # previous, longer frame never linger on screen.
+
+        pad_w = self.term_cols
         padded = []
         for line in all_lines:
+            if shaking and h_shift:
+                line = self._shift_line(line, h_shift)
             visible_len = _visible_length(line)
             if visible_len < pad_w:
                 line = line + " " * (pad_w - visible_len)
